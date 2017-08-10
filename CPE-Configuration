@@ -1,0 +1,186 @@
+import paramiko
+import ipaddress
+import socket
+import time
+
+###############################Defining functions to verify input##########################################
+def is_valid_ipv4_network(address):
+        try:
+                ipaddress.ip_network(address)
+        except ValueError:
+                print('That was not a valid entry, please try again')
+                time.sleep(3)
+                return False
+        else:
+                return True
+
+def is_valid_ipv4_address(address):
+        try:
+                ipaddress.ip_address(address)
+        except ValueError:
+                print('That was not a valid entry, please try again')
+                time.sleep(3)
+                return False
+        else:
+                return True
+
+###############################Changing the networks to the addresses that need to be configured on the tik####################################
+
+def public_network_to_gateway(network):
+        network = ipaddress.ip_network(network)
+        address = network[1]
+        address = str(address)
+        return address
+
+def transit_network_to_address(network):
+        network = ipaddress.ip_network(network)
+        address = network[-2]
+        address = str(address)
+        return address
+
+###############################Declaring variables that change from Tik to Tik and validating them##########################################
+
+validateHost = False
+validateTransit = False
+validatePublic = False
+validateLoopback = False
+validateArea = False
+
+customer = input('What is the customer name: ')
+customer = customer.replace(" ", "")
+
+while validateHost == False:
+        targetHost = input('What is the current IP address of the Mikrotik you are configuring to SSH to: ')
+        validateHost = is_valid_ipv4_address(targetHost)
+
+while validateLoopback == False:
+        loopback = input('What is the loopback interface IP address of the Mikrotik you are configuring: ')
+        validateLoopback = is_valid_ipv4_address(loopback)
+
+while validateTransit == False:
+        transitNetwork = input('What is the Transit network between this CPE and the POP router including the CIDR / netmask: ')
+        validateTransit = is_valid_ipv4_network(transitNetwork)
+
+while validatePublic == False:
+        publicNetwork = input('What is the public network for this CPE including the CIDR / netmask: ')
+        validatePublic = is_valid_ipv4_network(publicNetwork)
+
+#Getting the plat number to then use for the OSPF area ID calculation
+
+areaID = int(input('What is the plat account number for the customer: '))
+areaID = str(ipaddress.ip_address(areaID))
+
+downQueue = input('What is the customers download bandwidth allocation in MB: ')
+upQueue = input('What is the customers upload bandwidth allocation in MB: ')
+queue = upQueue + 'M/' + downQueue + 'M'
+
+##########################################Changing the IP network to the specific address to use with the CIDR mask and converting to string##########################################
+
+transitAddressStr = str(transitNetwork)
+publicAddressStr = str(publicNetwork)
+transitCIDR = transitAddressStr[-3:]
+publicCIDR = publicAddressStr[-3:]
+publicAddress = public_network_to_gateway(publicNetwork) + publicCIDR
+transitAddress = transit_network_to_address(transitNetwork) + transitCIDR
+
+############################Determining if the value entered was a 1 or 2 so the script can continue#################################
+
+while True:
+        vlanConfig = input('Is there a QnQ vlan configuration for this CPE: Type 1 for yes and 2 for no: ')
+        if (vlanConfig == '1') or (vlanConfig == '2'):
+                break
+        else:
+                print('That was not a valid entry, please try again')
+                time.sleep(3)
+
+####################################Using the value 1 or 2 to get the appropriate vlan(s) for the Tik configuration##############################
+
+if vlanConfig == '1':
+        vlan = input('What is the first Vlan that needs to be configured: ')
+        vlanQnQ = input('What is the second Vlan that needs to be configured: ')
+else:
+        vlan = input('What is the Vlan that needs to be configured: ')
+
+popName = input('What is the POP that this customer is serviced from: ')
+
+##################################Starting the Tik configuration and setting up SSH connection#######################################
+
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh.connect(targetHost, username='admin', password='', look_for_keys=False, timeout=5)
+
+##################################3011 base script consolidated for python use############################################
+
+ssh.exec_command('system script add source= """Add Tik script here"""
+ssh.exec_command('system script run script1;')
+time.sleep(2)
+
+##################################Configuration using variables starts#####################################
+
+#Setting the MTU for the transit interface
+
+ssh.exec_command('interface ethernet set mtu=1600 l2mtu=1700 name=ether10-Transit-to-QX-via-' + popName + ' numbers=9;')
+time.sleep(1)
+
+#Setting the Vlans for the Transit interface
+
+if vlanConfig == '1':
+        vlanInterface = vlan + '-QnQ-to-QX'
+        qnqInterface = vlan + '_' + vlanQnQ + '-Transit-to-QX'
+        ssh.exec_command('/interface vlan add interface=ether10 vlan-id=' + vlan + ' mtu=1604 name=' + vlanInterface + ';')
+        time.sleep(2)
+        ssh.exec_command('/interface vlan add interface=' + vlan + ' vlan-id=' + vlanQnQ + ' mtu=1600 name=' + qnqInterface + ';')
+        time.sleep(2)
+        ssh.exec_command('/ip address add address=' + transitAddress + ' interface=' + qnqInterface + ';')
+else:
+        vlanInterface = vlan + '-Transit-to-QX'
+        ssh.exec_command('/interface vlan add interface=ether10 vlan-id=' + vlan + ' name=' + vlanInterface + ';')
+        time.sleep(2)
+        ssh.exec_command('/ip address add address=' + transitAddress + ' interface=' + vlanInterface + ';')
+
+##################################Configuring public IP address on ether3####################################
+
+ssh.exec_command('ip address add address=' + publicAddress + ' interface=ether3;')
+
+##################################Configuring loopback IP address###################################
+
+ssh.exec_command('ip address add address=' + loopback + ' interface=Loopback0;')
+
+##################################Adding interfaces to OSPF##################################
+
+ssh.exec_command('routing ospf interface add interface=' + qnqInterface + ' cost=100 network-type=point-to-point;')
+
+#The other interfaces are added in the base scirpt
+
+##################################Adding networks to OSPF####################################
+
+#Adding area first
+
+areaName = customer + '-Area'
+ssh.exec_command('routing ospf area add area-id=' + areaID + ' type=stub name=' + areaName + ';')
+time.sleep(1)
+
+#Adding networks to the area
+
+ssh.exec_command('routing ospf network add network=' + transitNetwork + ' area=' + areaName + ';')
+ssh.exec_command('routing ospf network add network=' + publicNetwork + ' area=' + areaName + ';')
+ssh.exec_command('routing ospf network add network=' + loopback + ' area=' + areaName + ';')
+
+#Changing the router-id
+
+ssh.exec_command('routing ospf instance set router-id=' + loopback + ' numbers=0 redistribute-connected=as-type-1;')
+
+###################################Configuring MPLS#############################################
+
+ssh.exec_command('mpls ldp interface add interface=' + qnqInterface + ' transport-address=' + loopback + ' accept-dynamic-neighbors=yes;')
+ssh.exec_command('mpls ldp set lsr-id=' + loopback + ' transport-address=' + loopback + ' enabled=yes;')
+
+##################################Setting up queue##########################################
+
+ssh.exec_command('queue simple add name=' + customer + 'Queue target=ether3 max-limit=' + queue + ' limit-at=' + queue + ' queue=QXPCQ/QXPCQ total-queue=QXPCQ;')
+
+##################################Setting system identity and backups user###################################
+
+ssh.exec_command('system identity set name=CPE-' + customer + ';')
+ssh.exec_command('user add name=backups password=' + password + ' group=full address=64.191.128.xxx;')
+ssh.exec_command('password old-password="" new-password=' + password + ' confirm-new-password=' + password + ';')
